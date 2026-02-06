@@ -49,6 +49,7 @@ class PrinterClient:
         self.transport = BLETransport()
         self.notification_event = asyncio.Event()
         self.notification_data = None
+        self._rx_buf = bytearray()
 
     async def connect(self):
         if await self.transport.connect(self.device.address):
@@ -88,19 +89,25 @@ class PrinterClient:
         try:
             if not self.transport.client or not self.transport.client.is_connected:
                 await self.connect()
+            self._rx_buf.clear()
+            self.notification_event.clear()
             packet = NiimbotPacket(request_code, data)
             await self.transport.start_notification(self.char_uuid, self.notification_handler)
             await self.transport.write(packet.to_bytes(), self.char_uuid)
             logger.debug(f"Printer command sent - {RequestCodeEnum(request_code).name}")
-            await asyncio.wait_for(self.notification_event.wait(), timeout)  # Wait until the notification event is set
+            await asyncio.wait_for(self.notification_event.wait(), timeout)
+            logger.debug(f"Raw response for {RequestCodeEnum(request_code).name}: {self.notification_data.hex()}")
             response = NiimbotPacket.from_bytes(self.notification_data)
+            logger.debug(f"Parsed response for {RequestCodeEnum(request_code).name}: type=0x{response.type:02x} len={len(response.data)} data={response.data.hex()}")
             await self.transport.stop_notification(self.char_uuid)
-            self.notification_event.clear()  # Reset the event for the next notification
+            self.notification_event.clear()
             return response
         except asyncio.TimeoutError:
-            logger.error(f"Timeout occurred for request {RequestCodeEnum(request_code).name}")
+            logger.error(f"Timeout waiting for response to {RequestCodeEnum(request_code).name}", exc_info=True)
+            raise PrinterException(f"Timeout waiting for response to {RequestCodeEnum(request_code).name}")
         except BLEException as e:
-            logger.error(f"An error occurred: {e}")
+            logger.error(f"BLE error during {RequestCodeEnum(request_code).name}: {e}", exc_info=True)
+            raise
 
     async def write_raw(self, data):
         try:
@@ -108,7 +115,7 @@ class PrinterClient:
                 await self.connect()
             await self.transport.write(data.to_bytes(), self.char_uuid)
         except BLEException as e:
-            logger.error(f"An error occurred: {e}")
+            logger.error(f"BLE error during write_raw: {e}", exc_info=True)
 
     async def write_no_notify(self, request_code, data):
         try:
@@ -117,37 +124,57 @@ class PrinterClient:
             packet = NiimbotPacket(request_code, data)
             await self.transport.write(packet.to_bytes(), self.char_uuid)
         except BLEException as e:
-            logger.error(f"An error occurred: {e}")
+            logger.error(f"BLE error during {RequestCodeEnum(request_code).name} (no-notify): {e}", exc_info=True)
 
     def notification_handler(self, sender, data):
-        # print(f"Notification from {sender}: {data}")
-        logger.trace(f"Notification: {data}")
-        self.notification_data = data
+        logger.debug(f"BLE notification: len={len(data)} hex={data.hex()}")
+        self._rx_buf.extend(data)
+
+        start = self._rx_buf.find(b"\x55\x55")
+        if start == -1:
+            self._rx_buf.clear()
+            return
+        if start > 0:
+            self._rx_buf = self._rx_buf[start:]
+
+        if len(self._rx_buf) < 4:
+            return
+
+        pkt_len = self._rx_buf[3]
+        expected_len = 4 + pkt_len + 3  # header(4) + data + checksum(1) + trailer(2)
+
+        if len(self._rx_buf) < expected_len:
+            return
+
+        self.notification_data = bytes(self._rx_buf[:expected_len])
+        self._rx_buf = self._rx_buf[expected_len:]
         self.notification_event.set()
 
     async def print_image(self, image: Image, density: int = 3, quantity: int = 1, vertical_offset= 0,
                           horizontal_offset = 0):
         await self.set_label_density(density)
         await self.set_label_type(1)
-        await self.start_print()
+        await self.start_print(quantity)
         await self.start_page_print()
-        await self.set_dimension(image.height, image.width)
-        await self.set_quantity(quantity)
+        await self.set_dimension(image.height, image.width, quantity)
 
         for pkt in self._encode_image(image, vertical_offset, horizontal_offset):
-            # Send each line and wait for a response or status check
             await self.write_raw(pkt)
-            # Adding a short delay or status check here can help manage buffer issues
-            await asyncio.sleep(0.01)  # Adjust the delay as needed based on printer feedback
+            await asyncio.sleep(0.01)
+
+        self._rx_buf.clear()
+        self.notification_event.clear()
 
         while not await self.end_page_print():
             await asyncio.sleep(0.05)
 
         while True:
             status = await self.get_print_status()
-            if status['page'] == quantity:
+            if (status['page'] == quantity and
+                    status['progress1'] == 100 and
+                    status['progress2'] == 100):
                 break
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.3)
 
         await self.end_print()
 
@@ -262,8 +289,11 @@ class PrinterClient:
         packet = await self.send_command(RequestCodeEnum.SET_LABEL_DENSITY, bytes((n,)))
         return bool(packet.data[0])
 
-    async def start_print(self):
-        packet = await self.send_command(RequestCodeEnum.START_PRINT, b"\x01")
+    async def start_print(self, quantity=1):
+        packet = await self.send_command(
+            RequestCodeEnum.START_PRINT,
+            struct.pack(">H", quantity) + b"\x00\x00\x00\x00\x00"
+        )
         return bool(packet.data[0])
 
     async def end_print(self):
@@ -282,19 +312,22 @@ class PrinterClient:
         packet = await self.send_command(RequestCodeEnum.ALLOW_PRINT_CLEAR, b"\x01")
         return bool(packet.data[0])
 
-    async def set_dimension(self, w, h):
+    async def set_dimension(self, h, w, copies=1):
         packet = await self.send_command(
-            RequestCodeEnum.SET_DIMENSION, struct.pack(">HHH", w, h, 1)
+            RequestCodeEnum.SET_DIMENSION, struct.pack(">HHH", h, w, copies)
         )
-        return bool(packet.data[0])
-
-    async def set_quantity(self, n):
-        packet = await self.send_command(RequestCodeEnum.SET_QUANTITY, struct.pack(">H", n))
         return bool(packet.data[0])
 
     async def get_print_status(self):
         packet = await self.send_command(RequestCodeEnum.GET_PRINT_STATUS, b"\x01")
-        page, progress1, progress2 = struct.unpack(">HBB", packet.data)
+        logger.debug(f"GET_PRINT_STATUS response data: len={len(packet.data)} hex={packet.data.hex()}")
+        page, progress1, progress2 = struct.unpack_from(">HBB", packet.data, 0)
+
+        if len(packet.data) >= 7:
+            error_code = packet.data[6]
+            if error_code != 0:
+                raise PrinterException(f"Printer error during print (code {error_code})")
+
         return {"page": page, "progress1": progress1, "progress2": progress2}
 
     def __del__(self):

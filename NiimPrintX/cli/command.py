@@ -100,10 +100,11 @@ def print_command(model, density, rotate, image, quantity, vertical_offset, hori
         assert image.width <= max_width_px, f"Image width too big for {model.upper()}"
         asyncio.run(_print(model, density, image, quantity, vertical_offset, horizontal_offset))
     except Exception as e:
-        logger.info(f"{e}")
+        logger.error(f"Print command failed: {type(e).__name__}: {e}", exc_info=True)
 
 
 async def _print(model, density, image, quantity, vertical_offset, horizontal_offset):
+    printer = None
     try:
         print_info("Starting print job")
         device = await find_device(model)
@@ -113,10 +114,11 @@ async def _print(model, density, image, quantity, vertical_offset, horizontal_of
         await printer.print_image(image, density=density, quantity=quantity, vertical_offset=vertical_offset,
                                   horizontal_offset=horizontal_offset)
         print_success("Print job completed")
-        await printer.disconnect()
     except Exception as e:
-        logger.debug(f"{e}")
-        await printer.disconnect()
+        logger.error(f"Print job failed: {type(e).__name__}: {e}", exc_info=True)
+    finally:
+        if printer is not None:
+            await printer.disconnect()
 
 
 @niimbot_cli.command("info")
@@ -135,6 +137,7 @@ def info_command(model):
 
 
 async def _info(model):
+    printer = None
     try:
         device = await find_device(model)
         printer = PrinterClient(device)
@@ -145,11 +148,12 @@ async def _info(model):
         print(f"Device Serial : {device_serial}")
         print(f"Software Version : {software_version}")
         print(f"Hardware Version : {hardware_version}")
-        await printer.disconnect()
     except Exception as e:
-        logger.debug(f"{e}")
+        logger.error(f"Info command failed: {type(e).__name__}: {e}", exc_info=True)
         print_error(e)
-        # await printer.disconnect()
+    finally:
+        if printer is not None:
+            await printer.disconnect()
 
 
 cli = click.CommandCollection(sources=[niimbot_cli])
